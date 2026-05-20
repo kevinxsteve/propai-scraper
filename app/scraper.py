@@ -1,28 +1,26 @@
 """
-PropAI Scraper – ImmoScout24 Core Scraper
+PropAI Scraper – ZVG Portal Scraper
 
-Strategy: ImmoScout24 embeds all listing data as hidden JSON in
-a <script id="is24-react-app-initial-state"> tag.
-We extract this JSON directly – no HTML parsing, no browser needed.
-
-For detail pages: the same JSON is available in the page source.
+zvg-portal.de ist eine staatliche Website ohne Anti-Bot Schutz.
+Wir scrapen Zwangsversteigerungen direkt aus dem HTML.
 """
 
 import asyncio
-import json
 import re
 import logging
 from typing import Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode
 
 import httpx
+from bs4 import BeautifulSoup
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .models import SearchParams
 
 logger = logging.getLogger(__name__)
 
-# ── Headers that mimic a real browser ─────────────────────────────────────────
+BASE_URL = "https://www.zvg-portal.de"
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -30,19 +28,36 @@ HEADERS = {
         "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "DNT": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "no-cache",
+    "Accept-Language": "de-DE,de;q=0.9",
 }
 
-BASE_URL = "https://www.immobilienscout24.de"
+# Bundesland → ZVG Code
+BUNDESLAND_MAP = {
+    "baden-württemberg": "BW", "bayern": "BY", "berlin": "BE",
+    "brandenburg": "BB", "bremen": "HB", "hamburg": "HH",
+    "hessen": "HE", "mecklenburg-vorpommern": "MV", "niedersachsen": "NI",
+    "nordrhein-westfalen": "NW", "rheinland-pfalz": "RP", "saarland": "SL",
+    "sachsen": "SN", "sachsen-anhalt": "ST", "schleswig-holstein": "SH",
+    "thüringen": "TH",
+}
+
+# Stadt → Bundesland mapping (häufigste Städte)
+STADT_BUNDESLAND = {
+    "frankfurt": "hessen", "frankfurt am main": "hessen",
+    "münchen": "bayern", "munich": "bayern",
+    "berlin": "berlin", "hamburg": "hamburg",
+    "köln": "nordrhein-westfalen", "düsseldorf": "nordrhein-westfalen",
+    "dortmund": "nordrhein-westfalen", "essen": "nordrhein-westfalen",
+    "stuttgart": "baden-württemberg", "karlsruhe": "baden-württemberg",
+    "leipzig": "sachsen", "dresden": "sachsen",
+    "hannover": "niedersachsen", "braunschweig": "niedersachsen",
+    "wiesbaden": "hessen", "darmstadt": "hessen", "kassel": "hessen",
+    "mannheim": "baden-württemberg", "freiburg": "baden-württemberg",
+    "nürnberg": "bayern", "augsburg": "bayern",
+}
 
 
-class ImmoScout24Scraper:
+class ZVGScraper:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
@@ -53,353 +68,249 @@ class ImmoScout24Scraper:
                 headers=HEADERS,
                 follow_redirects=True,
                 timeout=30.0,
-                http2=True,
             )
         return self._client
 
-    # ── Build search URL ──────────────────────────────────────────────────────
-    def _build_url(self, params: SearchParams, page: int = 1) -> str:
-        """
-        ImmoScout24 URL format:
-        /Suche/{sort}/{type}/{location}/{price}/{rooms}/{sqm}/
-        Example: /Suche/S-T/Wohnung-Kauf/Berlin/Berlin/EURO--500000.00/2.0-/60.00-
-        """
-        # Object type mapping
-        type_map = {
-            "wohnung-kauf": "Wohnung-Kauf",
-            "haus-kauf":    "Haus-Kauf",
-            "wohnung-miete":"Wohnung-Miete",
-            "haus-miete":   "Haus-Miete",
+    def _get_bundesland(self, ort: str) -> str:
+        """Ermittle Bundesland aus Stadtname."""
+        ort_lower = ort.lower().strip()
+        return STADT_BUNDESLAND.get(ort_lower, "hessen")
+
+    def _build_search_url(self, params: SearchParams, page: int = 1) -> str:
+        """Baue ZVG-Portal Suchanfrage URL."""
+        bundesland = self._get_bundesland(params.ort)
+        bl_code = BUNDESLAND_MAP.get(bundesland, "HE")
+
+        query = {
+            "bundesland": bl_code,
+            "suchbegriff": params.ort,
+            "objekt_klasse": self._get_objekt_klasse(params.objekttyp),
+            "seite": page,
         }
-        obj_type = type_map.get(params.objekttyp, "Wohnung-Kauf")
+        return f"{BASE_URL}/index.php/ajax_request/index?" + urlencode(query)
 
-        # Location: encode city name
-        location = quote(params.ort, safe="")
+    def _get_objekt_klasse(self, typ: str) -> str:
+        """Map Objekttyp zu ZVG Klasse."""
+        if "wohnung" in typ.lower():
+            return "Wohnung"
+        elif "haus" in typ.lower() or "efh" in typ.lower():
+            return "Haus"
+        elif "grundstück" in typ.lower():
+            return "Grundstück"
+        return ""  # Alle
 
-        # Price range
-        price_min = f"{params.min_price:.2f}" if params.min_price else ""
-        price_max = f"{params.max_price:.2f}" if params.max_price else ""
-        price_seg = f"EURO-{price_min}-{price_max}" if (price_min or price_max) else ""
-
-        # Rooms
-        room_min = f"{params.min_rooms:.1f}" if params.min_rooms else ""
-        room_seg = f"{room_min}-" if room_min else ""
-
-        # SQM
-        sqm_min = f"{params.min_sqm:.2f}" if params.min_sqm else ""
-        sqm_seg = f"{sqm_min}-" if sqm_min else ""
-
-        # Build path segments
-        segments = ["/Suche/S-T", obj_type, location, location]
-        if price_seg:  segments.append(price_seg)
-        if room_seg:   segments.append(room_seg)
-        if sqm_seg:    segments.append(sqm_seg)
-
-        url = BASE_URL + "/".join(segments)
-        if page > 1:
-            url += f"?pagenumber={page}"
-        return url
-
-    # ── Fetch a page and extract hidden JSON ──────────────────────────────────
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=8))
-    async def _fetch_json(self, url: str) -> Optional[dict]:
-        """Fetch page and extract the hidden JSON state."""
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=5))
+    async def _fetch_page(self, url: str) -> Optional[str]:
+        """Hole eine Seite vom ZVG-Portal."""
         client = await self._get_client()
-        logger.info(f"Fetching: {url}")
-
+        logger.info(f"Fetching ZVG: {url}")
         try:
             response = await client.get(url)
             response.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"HTTP {e.response.status_code} for {url}")
-            return None
+            return response.text
         except Exception as e:
-            logger.error(f"Request failed: {e}")
+            logger.error(f"ZVG fetch error: {e}")
             return None
 
-        html = response.text
+    def _parse_listing(self, row, bundesland: str, ort: str) -> Optional[dict]:
+        """Parse eine ZVG Zeile aus der Ergebnistabelle."""
+        try:
+            cells = row.find_all("td")
+            if len(cells) < 6:
+                return None
 
-        # Strategy 1: Extract from <script id="is24-react-app-initial-state">
-        pattern = r'<script[^>]*id=["\']is24-react-app-initial-state["\'][^>]*>(.*?)</script>'
-        match = re.search(pattern, html, re.DOTALL)
-        if match:
+            # Aktenzeichen als ID
+            az = cells[0].get_text(strip=True)
+            if not az:
+                return None
+
+            # Objektart
+            obj_art = cells[1].get_text(strip=True)
+
+            # Adresse
+            adresse = cells[2].get_text(strip=True)
+
+            # Amtsgericht
+            gericht = cells[3].get_text(strip=True)
+
+            # Termin
+            termin = cells[4].get_text(strip=True)
+
+            # Verkehrswert
+            vw_text = cells[5].get_text(strip=True)
+            vw_text_clean = re.sub(r'[^\d,.]', '', vw_text)
             try:
-                return json.loads(match.group(1))
-            except json.JSONDecodeError:
-                pass
+                verkehrswert = float(vw_text_clean.replace('.', '').replace(',', '.'))
+            except (ValueError, TypeError):
+                verkehrswert = None
 
-        # Strategy 2: Find __INITIAL_STATE__ in any script tag
-        patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'"searchResponseModel"\s*:\s*({.*?"resultlist".*?})',
-            r'<script[^>]*>\s*var\s+IS24\s*=\s*({.*?});\s*</script>',
-        ]
-        for pat in patterns:
-            match = re.search(pat, html, re.DOTALL)
-            if match:
+            # Mindestgebot (typisch 50-70% des Verkehrswerts)
+            mindestgebot = round(verkehrswert * 0.5, 0) if verkehrswert else None
+
+            # Detail-Link
+            detail_link = ""
+            link_tag = row.find("a")
+            if link_tag and link_tag.get("href"):
+                href = link_tag["href"]
+                detail_link = href if href.startswith("http") else f"{BASE_URL}{href}"
+
+            # Wohnfläche aus Beschreibung extrahieren
+            wfl = None
+            desc_text = " ".join(c.get_text() for c in cells)
+            wfl_match = re.search(r'(\d+[,.]?\d*)\s*m²', desc_text)
+            if wfl_match:
                 try:
-                    return json.loads(match.group(1))
-                except json.JSONDecodeError:
-                    continue
+                    wfl = float(wfl_match.group(1).replace(',', '.'))
+                except ValueError:
+                    pass
 
-        # Strategy 3: Try to find JSON in any script with "resultlist"
-        scripts = re.findall(r'<script[^>]*>(.*?)</script>', html, re.DOTALL)
-        for script in scripts:
-            if '"resultlist"' in script or '"searchResult"' in script:
-                # Try to extract JSON object
-                json_match = re.search(r'\{.*"resultlist".*\}', script, re.DOTALL)
-                if json_match:
-                    try:
-                        return json.loads(json_match.group(0))
-                    except json.JSONDecodeError:
-                        pass
+            # Zimmer aus Beschreibung
+            zimmer = None
+            zi_match = re.search(r'(\d+[,.]?\d*)\s*(?:Zimmer|Zi\.)', desc_text)
+            if zi_match:
+                try:
+                    zimmer = float(zi_match.group(1).replace(',', '.'))
+                except ValueError:
+                    pass
 
-        logger.warning(f"No JSON state found in page: {url}")
-        return None
+            # ID aus Aktenzeichen
+            listing_id = f"zvg_{az.replace('/', '_').replace(' ', '_')}"
 
-    # ── Parse listings from JSON state ────────────────────────────────────────
-    def _parse_listings(self, state: dict) -> list:
-        """Extract listing objects from the JSON state."""
+            return {
+                "id":            listing_id,
+                "titel":         f"{obj_art} – {adresse[:50]}",
+                "adresse":       adresse,
+                "ort":           ort,
+                "plz":           "",
+                "preis":         mindestgebot,
+                "preis_m2":      round(mindestgebot / wfl, 0) if mindestgebot and wfl else None,
+                "wohnflaeche":   wfl,
+                "zimmer":        zimmer,
+                "baujahr":       None,
+                "objekttyp":     obj_art,
+                "zustand":       "Zwangsversteigerung",
+                "energie_klasse": "k.A.",
+                "heizungsart":   "",
+                "balkon":        False,
+                "keller":        False,
+                "aufzug":        False,
+                "kaltmiete":     None,
+                "url":           detail_link or f"{BASE_URL}/index.php",
+                "bilder":        [],
+                "quelle":        "ZVG-Portal",
+                "online_seit":   termin,
+                # ZVG-spezifisch
+                "aktenzeichen":  az,
+                "amtsgericht":   gericht,
+                "termin":        termin,
+                "verkehrswert":  verkehrswert,
+                "mindestgebot":  mindestgebot,
+                "rabatt_pct":    round((1 - mindestgebot/verkehrswert) * 100, 1) if verkehrswert and mindestgebot else 50.0,
+            }
+        except Exception as e:
+            logger.debug(f"Parse error: {e}")
+            return None
+
+    def _parse_results(self, html: str, ort: str, bundesland: str) -> list:
+        """Parse ZVG Suchergebnisse aus HTML."""
+        soup = BeautifulSoup(html, "lxml")
         listings = []
 
-        # Navigate the nested state structure
-        # Common paths in IS24 state
-        paths = [
-            ["searchResponseModel", "resultlist", "resultlistEntries", 0, "resultlistEntry"],
-            ["resultlist", "resultlistEntries", 0, "resultlistEntry"],
-            ["searchResult", "listings"],
-            ["listings"],
-        ]
-
-        raw_listings = []
-        for path in paths:
-            obj = state
-            try:
-                for key in path:
-                    if isinstance(key, int):
-                        obj = obj[key]
-                    else:
-                        obj = obj[key]
-                if isinstance(obj, list) and obj:
-                    raw_listings = obj
-                    break
-            except (KeyError, IndexError, TypeError):
-                continue
-
-        if not raw_listings:
-            logger.warning("No listings found in JSON state")
-            return []
-
-        for raw in raw_listings:
-            try:
-                listing = self._parse_single(raw)
+        # Suche Ergebnistabelle
+        tables = soup.find_all("table")
+        for table in tables:
+            rows = table.find_all("tr")
+            for row in rows[1:]:  # Skip header
+                listing = self._parse_listing(row, bundesland, ort)
                 if listing:
                     listings.append(listing)
-            except Exception as e:
-                logger.debug(f"Parse error for listing: {e}")
-                continue
+
+        # Fallback: Suche nach divs mit Objektdaten
+        if not listings:
+            obj_divs = soup.find_all("div", class_=re.compile(r"objekt|result|listing", re.I))
+            for div in obj_divs:
+                text = div.get_text()
+                if "€" in text or "Verkehrswert" in text:
+                    listing = self._parse_div(div, ort)
+                    if listing:
+                        listings.append(listing)
 
         return listings
 
-    def _parse_single(self, raw: dict) -> Optional[dict]:
-        """Parse a single listing from raw JSON."""
-        # IS24 wraps listings in various ways
-        expose = (
-            raw.get("resultlistEntry") or
-            raw.get("expose") or
-            raw.get("listing") or
-            raw
-        )
+    def _parse_div(self, div, ort: str) -> Optional[dict]:
+        """Fallback: Parse Objekt aus div."""
+        try:
+            text = div.get_text(strip=True)
+            vw_match = re.search(r'Verkehrswert[:\s]+([0-9.,]+)\s*€', text)
+            if not vw_match:
+                return None
 
-        # Get the actual data object
-        data = expose.get("expose", expose)
+            vw = float(vw_match.group(1).replace('.', '').replace(',', '.'))
+            az_match = re.search(r'(\d+\s*K\s*\d+/\d+)', text)
+            az = az_match.group(1) if az_match else f"zvg_{id(div)}"
 
-        # ID
-        listing_id = str(
-            data.get("@id") or
-            data.get("id") or
-            expose.get("@id") or
-            ""
-        )
-        if not listing_id:
+            return {
+                "id":           f"zvg_{az.replace('/', '_')}",
+                "titel":        text[:60],
+                "adresse":      ort,
+                "ort":          ort,
+                "plz":          "",
+                "preis":        round(vw * 0.5, 0),
+                "verkehrswert": vw,
+                "mindestgebot": round(vw * 0.5, 0),
+                "rabatt_pct":   50.0,
+                "quelle":       "ZVG-Portal",
+                "url":          BASE_URL,
+                "bilder":       [],
+            }
+        except Exception:
             return None
 
-        # Title
-        title = (
-            data.get("title") or
-            data.get("titlePicture", {}).get("title", "") or
-            ""
-        )
-
-        # Address
-        addr_data = data.get("address", {})
-        street   = addr_data.get("street", "")
-        house_nr = addr_data.get("houseNumber", "")
-        city     = addr_data.get("city", "")
-        plz      = addr_data.get("postcode", "")
-        adresse  = f"{street} {house_nr}".strip() or city
-
-        # Attributes
-        attrs = {}
-        for attr_list in [
-            data.get("attributes", {}).get("attribute", []),
-            data.get("features", []),
-        ]:
-            if isinstance(attr_list, list):
-                for a in attr_list:
-                    if isinstance(a, dict):
-                        key = a.get("label", a.get("type", "")).lower()
-                        val = a.get("value", a.get("values", [""])[0] if a.get("values") else "")
-                        attrs[key] = val
-
-        # Price
-        price_raw = (
-            data.get("price", {}).get("value") or
-            data.get("calculatedTotalRent", {}).get("totalRent", {}).get("value") or
-            attrs.get("kaufpreis") or
-            attrs.get("kaltmiete") or
-            0
-        )
-        try:
-            price = float(str(price_raw).replace(".", "").replace(",", ".").replace("€", "").strip())
-        except (ValueError, TypeError):
-            price = 0.0
-
-        # Area
-        area_raw = (
-            data.get("livingSpace") or
-            attrs.get("wohnfläche") or
-            attrs.get("wohnflaeche") or
-            0
-        )
-        try:
-            area = float(str(area_raw).replace(",", ".").replace("m²", "").strip())
-        except (ValueError, TypeError):
-            area = 0.0
-
-        # Rooms
-        rooms_raw = (
-            data.get("numberOfRooms") or
-            attrs.get("zimmer") or
-            attrs.get("rooms") or
-            0
-        )
-        try:
-            rooms = float(str(rooms_raw).replace(",", "."))
-        except (ValueError, TypeError):
-            rooms = 0.0
-
-        # Price per m²
-        price_m2 = round(price / area, 2) if price and area else None
-
-        # Year built
-        year_raw = data.get("constructionYear") or attrs.get("baujahr") or 0
-        try:
-            year = int(str(year_raw).strip())
-        except (ValueError, TypeError):
-            year = None
-
-        # Features
-        features = str(data.get("features", "")).lower()
-        feat_list = [str(f).lower() for f in data.get("featuresList", [])]
-        all_features = features + " ".join(feat_list)
-
-        # URL
-        url = f"https://www.immobilienscout24.de/expose/{listing_id}"
-
-        # Images
-        pictures = data.get("titlePicture", {})
-        images = []
-        if pictures.get("@xlink:href"):
-            images.append(pictures["@xlink:href"])
-        for pic in data.get("pictures", {}).get("picture", []):
-            if isinstance(pic, dict) and pic.get("@xlink:href"):
-                images.append(pic["@xlink:href"])
-
-        return {
-            "id": listing_id,
-            "titel": title or f"{city} · {rooms}Zi · {area}m²",
-            "adresse": adresse,
-            "ort": city or "",
-            "plz": plz or "",
-            "preis": price or None,
-            "preis_m2": price_m2,
-            "wohnflaeche": area or None,
-            "zimmer": rooms or None,
-            "baujahr": year,
-            "objekttyp": data.get("type", {}).get("@codeValue", ""),
-            "zustand": data.get("condition", {}).get("@codeValue", ""),
-            "energie_klasse": data.get("energyPerformanceCertificate", {}).get("energyEfficiencyClass", ""),
-            "heizungsart": attrs.get("heizungsart", ""),
-            "balkon": "balkon" in all_features or bool(data.get("balcony")),
-            "keller": "keller" in all_features or bool(data.get("cellar")),
-            "aufzug": "aufzug" in all_features or bool(data.get("lift")),
-            "kaltmiete": None,
-            "url": url,
-            "bilder": images[:5],
-            "quelle": "immoscout24",
-            "online_seit": data.get("creationDate", ""),
-        }
-
-    # ── Public search method ───────────────────────────────────────────────────
     async def search(self, params: SearchParams) -> list:
-        """Search IS24 and return list of listings."""
+        """Suche ZVG-Objekte."""
         all_listings = []
         seen_ids = set()
+        bundesland = self._get_bundesland(params.ort)
 
-        for page in range(1, params.max_pages + 1):
-            url = self._build_url(params, page)
-            state = await self._fetch_json(url)
+        for page in range(1, min(params.max_pages + 1, 6)):
+            url = self._build_search_url(params, page)
+            html = await self._fetch_page(url)
 
-            if not state:
-                logger.warning(f"No data on page {page}, stopping")
+            if not html:
                 break
 
-            page_listings = self._parse_listings(state)
+            listings = self._parse_results(html, params.ort, bundesland)
 
-            if not page_listings:
-                logger.info(f"Page {page}: empty, stopping")
+            if not listings:
+                logger.info(f"ZVG page {page}: no results, stopping")
                 break
 
-            # Deduplicate
-            new = [l for l in page_listings if l["id"] not in seen_ids]
+            new = [l for l in listings if l["id"] not in seen_ids]
             seen_ids.update(l["id"] for l in new)
             all_listings.extend(new)
 
-            logger.info(f"Page {page}: {len(new)} new listings (total: {len(all_listings)})")
+            logger.info(f"ZVG page {page}: {len(new)} listings (total: {len(all_listings)})")
 
-            # Polite delay between pages
-            if page < params.max_pages:
-                await asyncio.sleep(1.5)
-
-            # Apply price filter
+            # Filter
             if params.max_price:
                 all_listings = [
                     l for l in all_listings
-                    if not l["preis"] or l["preis"] <= params.max_price
+                    if not l.get("preis") or l["preis"] <= params.max_price
                 ]
+
+            await asyncio.sleep(1.0)
 
         return all_listings
 
-    # ── Fetch single listing detail ───────────────────────────────────────────
     async def get_detail(self, listing_id: str) -> Optional[dict]:
-        """Fetch full detail page for a single listing."""
-        url = f"{BASE_URL}/expose/{listing_id}"
-        state = await self._fetch_json(url)
-        if not state:
-            return None
-
-        # Detail page has a different structure
-        expose = (
-            state.get("expose") or
-            state.get("exposePage", {}).get("expose") or
-            {}
-        )
-        if expose:
-            return self._parse_single({"expose": expose})
-
+        """Hole ZVG Detail."""
+        # ZVG Details sind in der Listenansicht enthalten
         return None
 
     async def close(self):
         if self._client:
             await self._client.aclose()
+
+
+# ── Backward compatibility: keep ImmoScout24Scraper name ──────────────────────
+ImmoScout24Scraper = ZVGScraper
